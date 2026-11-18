@@ -1,0 +1,84 @@
+CREATE OR ALTER PROCEDURE dbo.usp_RefreshDeliverySchedule
+    @RunDate DATE = NULL,
+    @Force   BIT  = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @cnt INT, @id BIGINT, @site INT, @msb DATETIME, @sql NVARCHAR(MAX), @ym CHAR(6);
+
+    IF @RunDate IS NULL
+        SET @RunDate = CAST(DATEADD(DAY, -1, GETDATE()) AS DATE);
+
+    SELECT @cnt = COUNT(*) FROM stg.Orders WITH (NOLOCK);
+
+    IF @cnt < 500 AND @Force = 0
+    BEGIN
+        INSERT INTO dbo.EtlLog (RunDate, Step, Msg) VALUES (@RunDate, 'CHK', 'low vol skip');
+        RETURN 0;
+    END
+
+    BEGIN TRY
+        DELETE FROM dbo.DeliverySchedule WHERE RunDate = @RunDate;
+
+        INSERT INTO dbo.DeliverySchedule
+        SELECT o.*, @RunDate, NULL, NULL, 'PLANNED', GETDATE()
+        FROM stg.Orders o WITH (NOLOCK)
+        WHERE o.stat IN ('New', 'Confirmed');
+
+        UPDATE ds
+        SET ds.MustShipBy = DATEADD(HOUR, -1 * (t.TransitHours + 2),
+                                DATEADD(HOUR, CASE ds.win WHEN 'A' THEN 6 WHEN 'B' THEN 10 ELSE 14 END,
+                                        CAST(ds.req_dt AS DATETIME)))
+        FROM dbo.DeliverySchedule ds
+        JOIN dbo.RegionTransit t WITH (NOLOCK) ON t.Region = ds.region
+        WHERE ds.RunDate = @RunDate;
+
+        UPDATE dbo.DeliverySchedule
+        SET RouteCode = region + '-' + win + '-' + RIGHT('000' + CAST(site_id % 40 AS VARCHAR(3)), 3)
+        WHERE RunDate = @RunDate;
+
+        UPDATE dbo.DeliverySchedule
+        SET SchedStatus = 'AT RISK'
+        WHERE RunDate = @RunDate
+          AND (MustShipBy < GETDATE() OR MustShipBy IS NULL);
+
+        UPDATE dbo.DeliverySchedule
+        SET SchedStatus = 'RUSH'
+        WHERE RunDate = @RunDate AND rush = 1 AND SchedStatus = 'PLANNED';
+
+        DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+            SELECT order_id, site_id, MustShipBy
+            FROM dbo.DeliverySchedule
+            WHERE RunDate = @RunDate AND SchedStatus = 'AT RISK';
+
+        OPEN c;
+        FETCH NEXT FROM c INTO @id, @site, @msb;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            INSERT INTO dbo.Notifications (CreatedAt, Recipient, Subject, Body)
+            VALUES (GETDATE(), 'dispatch.supervisor@example.com',
+                    'AT RISK order ' + CAST(@id AS VARCHAR(20)),
+                    'Site ' + CAST(@site AS VARCHAR(10)) + ' must ship by ' + ISNULL(CONVERT(VARCHAR(16), @msb, 120), 'UNKNOWN'));
+            FETCH NEXT FROM c INTO @id, @site, @msb;
+        END
+        CLOSE c;
+        DEALLOCATE c;
+
+        SET @ym = CONVERT(CHAR(6), @RunDate, 112);
+        SET @sql = N'IF OBJECT_ID(''arc.DeliverySchedule_' + @ym + ''') IS NULL '
+                 + N'SELECT * INTO arc.DeliverySchedule_' + @ym + N' FROM dbo.DeliverySchedule WHERE 1 = 0; '
+                 + N'INSERT INTO arc.DeliverySchedule_' + @ym + N' SELECT * FROM dbo.DeliverySchedule WHERE RunDate = '''
+                 + CONVERT(CHAR(10), @RunDate, 120) + N''';';
+        EXEC (@sql);
+
+        DELETE FROM dbo.DeliverySchedule WHERE RunDate < DATEADD(DAY, -45, @RunDate);
+
+        INSERT INTO dbo.EtlLog (RunDate, Step, Msg) VALUES (@RunDate, 'OK', CAST(@cnt AS VARCHAR(12)) + ' staged');
+    END TRY
+    BEGIN CATCH
+        INSERT INTO dbo.EtlLog (RunDate, Step, Msg) VALUES (@RunDate, 'ERR', LEFT(ERROR_MESSAGE(), 200));
+    END CATCH
+
+    RETURN 0;
+END

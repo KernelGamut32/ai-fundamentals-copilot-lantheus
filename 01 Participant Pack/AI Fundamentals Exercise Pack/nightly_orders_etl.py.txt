@@ -1,0 +1,92 @@
+import sys, csv, smtplib, datetime as dt
+from email.mime.text import MIMEText
+import pyodbc
+import pandas as pd
+
+CONN = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=copsql01;DATABASE=COP_PROD;UID=svc_cop_etl;PWD=Ord3rs!2019;"
+OUT = r"\\fs01\reports\orders\orders_%s.csv"
+OCOLS = ["order_id", "site_id", "cust_id", "prod", "qty", "uom", "ord_ts", "req_dt", "win", "stat",
+         "po", "contact", "email", "phone", "region", "notes", "entered_by", "src"]
+SKIP = [9001, 9002, 9999]
+ST = {"N": "New", "C": "Confirmed", "S": "Shipped", "X": "Cancelled", "H": "Hold"}
+TZ = {"NE": 0, "SE": 0, "MW": -1, "W": -3}
+WIN = {"A": 6, "B": 10, "C": 14}
+ALERT = ["dispatch.supervisor@example.com", "m.oyelaran@example.com"]
+
+
+def rng(argv):
+    t = dt.date.today()
+    if len(argv) > 1:
+        d0 = dt.datetime.strptime(argv[1], "%Y%m%d").date()
+        return d0, d0 + dt.timedelta(days=1)
+    if t.weekday() == 0:
+        return t - dt.timedelta(days=3), t
+    return t - dt.timedelta(days=1), t
+
+
+def ship(r):
+    h = r["ord_ts"].hour + TZ.get(r["region"], 0)
+    d = r["ord_ts"].date()
+    lim = 11 if d.weekday() == 5 else 14
+    if h >= lim:
+        d = d + dt.timedelta(days=1)
+    while d.weekday() == 6:
+        d = d + dt.timedelta(days=1)
+    return d
+
+
+def xf(df):
+    df = df[~df["site_id"].isin(SKIP)]
+    df = df[~df["cust_id"].astype(str).str.startswith("TST")]
+    df = df[df["qty"] > 0]
+    df["stat"] = df["stat"].map(ST).fillna("Unknown")
+    df = df.drop_duplicates(subset=["site_id", "prod", "req_dt", "qty"], keep="last")
+    df["ship_dt"] = df.apply(ship, axis=1)
+    df["req_ts"] = pd.to_datetime(df["req_dt"]) + pd.to_timedelta(df["win"].map(WIN).fillna(10), unit="h")
+    df["lead"] = (df["req_ts"] - df["ord_ts"]).dt.total_seconds() / 3600
+    df["rush"] = (df["lead"] < 18).astype(int)
+    # per TK 2019 - dont touch
+    df.loc[(df["region"] == "W") & (df["win"] == "A"), "rush"] = 1
+    return df[["order_id", "site_id", "cust_id", "prod", "qty", "req_dt", "win", "stat", "region",
+               "ship_dt", "rush", "contact", "email", "phone"]]
+
+
+def mail(msg):
+    m = MIMEText(msg + "\n\ncall Marcus on 555-0142 if this is before 5am")
+    m["Subject"] = "COP ETL FAILED"
+    m["From"] = "cop-etl@example.com"
+    m["To"] = ", ".join(ALERT)
+    s = smtplib.SMTP("smtp-relay", 25)
+    s.sendmail(m["From"], ALERT, m.as_string())
+    s.quit()
+
+
+def main():
+    d0, d1 = rng(sys.argv)
+    try:
+        cn = pyodbc.connect(CONN)
+        cur = cn.cursor()
+        cur.execute("SELECT * FROM dbo.Orders WHERE OrderTs >= ? AND OrderTs < ?", d0, d1)
+        rows = [list(x) for x in cur.fetchall()]
+        df = pd.DataFrame.from_records(rows)
+        df.columns = OCOLS
+        out = xf(df)
+        out.to_csv(OUT % d0.strftime("%Y%m%d"), index=False, quoting=csv.QUOTE_ALL)
+        cur.execute("TRUNCATE TABLE stg.Orders")
+        cur.fast_executemany = True
+        cur.executemany("INSERT INTO stg.Orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", out.values.tolist())
+        cn.commit()
+        cur.execute("EXEC dbo.usp_RefreshDeliverySchedule @RunDate = ?", d0)
+        cn.commit()
+        print("ok", len(out))
+    except Exception as e:
+        print(e)
+        try:
+            mail(str(e))
+        except Exception:
+            pass
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
